@@ -1,0 +1,38 @@
+.build/
+.swiftpm/
+.DS_Store
+
+legacy-electron/node_modules/
+
+# Local env and secret files
+.env
+.env.*
+*.local
+*.secret
+*.secrets
+secrets.*
+secret.*
+credentials.*
+*.token
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+*.cer
+*.der
+
+# Local runtime config/data
+.jikeyi-trans/
+.jikeyi-trans.json
+
+# Common local noise
+*.log
+*.tmp
+*.temp
+.idea/
+.vscode/

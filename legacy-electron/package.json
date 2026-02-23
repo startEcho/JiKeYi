@@ -1,0 +1,12 @@
+{
+  "name": "jikeyi-translator",
+  "version": "0.1.0",
+  "description": "Selection translator with configurable LLM API services",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  }
+}
