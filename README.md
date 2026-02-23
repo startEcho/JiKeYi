@@ -154,3 +154,9 @@ KEYCHAIN_PROFILE="AC_NOTARY" \
 - 不要把真实 API Key 写死在源码里。
 - 建议仅在本机配置文件中保存 API Key。
 - 发布前确认 `.gitignore` 已排除 `.env`、密钥文件和本地运行数据。
+
+## 效果展示
+
+![](https://echo-machile.oss-cn-beijing.aliyuncs.com/typora/20260223094137_9561.png)
+
+![](https://echo-machile.oss-cn-beijing.aliyuncs.com/typora/20260223094244_8731.png)
