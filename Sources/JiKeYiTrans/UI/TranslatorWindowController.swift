@@ -7,6 +7,9 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
   private var currentMode: PopupMode = .panel
   private var lastAnchor: CGRect?
   private var lastStreamingResizeUptime: TimeInterval = 0
+  private var bubblePinned = false
+  private var transientTipWindow: NSPanel?
+  private var transientTipDismissTask: Task<Void, Never>?
   var onBubbleDismiss: (() -> Void)?
   var onWindowHidden: (() -> Void)?
   var onReplaceTranslationRequested: ((String, String) -> Void)?
@@ -35,6 +38,9 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
     window.delegate = self
     viewModel.onReplaceTranslationRequested = { [weak self] serviceID, text in
       self?.onReplaceTranslationRequested?(serviceID, text)
+    }
+    viewModel.onBubblePinChanged = { [weak self] isPinned in
+      self?.setBubblePinned(isPinned)
     }
   }
 
@@ -134,12 +140,146 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
     adaptWindowSize(allowShrink: true, positionUsingAnchor: false)
   }
 
+  func showTransientTip(_ message: String, duration: TimeInterval = 1.8) {
+    presentTransientTip(message, autoDismissAfter: duration)
+  }
+
+  func showPersistentTransientTip(_ message: String) {
+    presentTransientTip(message, autoDismissAfter: nil)
+  }
+
+  func hideTransientTip() {
+    transientTipDismissTask?.cancel()
+    transientTipDismissTask = nil
+
+    guard let transientTipWindow else {
+      return
+    }
+    transientTipWindow.orderOut(nil)
+    transientTipWindow.close()
+    self.transientTipWindow = nil
+  }
+
+  private func presentTransientTip(_ message: String, autoDismissAfter: TimeInterval?) {
+    let text = message.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !text.isEmpty else {
+      return
+    }
+
+    transientTipDismissTask?.cancel()
+    transientTipDismissTask = nil
+
+    if let transientTipWindow {
+      transientTipWindow.orderOut(nil)
+      transientTipWindow.close()
+      self.transientTipWindow = nil
+    }
+
+    let contentView = NSHostingView(rootView: TransientTipView(message: text))
+    let fitting = contentView.fittingSize
+    let width = min(max(fitting.width, 220), 560)
+    let height = min(max(fitting.height, 44), 140)
+
+    let tipWindow = NSPanel(
+      contentRect: NSRect(x: 0, y: 0, width: width, height: height),
+      styleMask: [.borderless, .nonactivatingPanel],
+      backing: .buffered,
+      defer: false
+    )
+    tipWindow.contentView = contentView
+    tipWindow.level = .statusBar
+    tipWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+    tipWindow.isOpaque = false
+    tipWindow.backgroundColor = .clear
+    tipWindow.hasShadow = true
+    tipWindow.ignoresMouseEvents = true
+    tipWindow.alphaValue = 0
+    tipWindow.hidesOnDeactivate = false
+
+    positionTransientTipWindow(tipWindow)
+    tipWindow.orderFront(nil)
+
+    NSAnimationContext.runAnimationGroup { context in
+      context.duration = 0.12
+      context.timingFunction = CAMediaTimingFunction(name: .easeOut)
+      tipWindow.animator().alphaValue = 1
+    }
+
+    transientTipWindow = tipWindow
+
+    guard let autoDismissAfter else {
+      return
+    }
+
+    transientTipDismissTask = Task { [weak self, weak tipWindow] in
+      let nanos = UInt64(max(0.8, autoDismissAfter) * 1_000_000_000)
+      try? await Task.sleep(nanoseconds: nanos)
+      guard !Task.isCancelled else {
+        return
+      }
+
+      await MainActor.run {
+        guard let self, let tipWindow else {
+          return
+        }
+        self.dismissTransientTipWindow(tipWindow)
+      }
+    }
+  }
+
+  private func dismissTransientTipWindow(_ tipWindow: NSPanel) {
+    NSAnimationContext.runAnimationGroup { context in
+      context.duration = 0.18
+      context.timingFunction = CAMediaTimingFunction(name: .easeIn)
+      tipWindow.animator().alphaValue = 0
+    }
+
+    Task { @MainActor [weak self, weak tipWindow] in
+      try? await Task.sleep(nanoseconds: 200_000_000)
+      guard let self, let tipWindow else {
+        return
+      }
+      tipWindow.orderOut(nil)
+      tipWindow.close()
+      if self.transientTipWindow === tipWindow {
+        self.transientTipWindow = nil
+      }
+      if self.transientTipDismissTask != nil {
+        self.transientTipDismissTask = nil
+      }
+    }
+  }
+
   private func throttledStreamingResize() {
     let now = ProcessInfo.processInfo.systemUptime
     if now - lastStreamingResizeUptime > 0.12 {
       lastStreamingResizeUptime = now
       adaptWindowSize(allowShrink: false, positionUsingAnchor: false)
     }
+  }
+
+  private func positionTransientTipWindow(_ tipWindow: NSPanel) {
+    let targetPoint = NSEvent.mouseLocation
+    let screen = NSScreen.screens.first(where: { $0.frame.contains(targetPoint) })
+      ?? NSScreen.main
+      ?? NSScreen.screens.first
+
+    guard let screen else {
+      return
+    }
+
+    let visible = screen.visibleFrame
+    let margin: CGFloat = 12
+    var frame = tipWindow.frame
+    frame.origin.x = min(
+      max(targetPoint.x - frame.width / 2, visible.minX + margin),
+      visible.maxX - frame.width - margin
+    )
+    frame.origin.y = min(
+      max(targetPoint.y + 24, visible.minY + margin),
+      visible.maxY - frame.height - margin
+    )
+    tipWindow.setFrame(frame, display: false)
   }
 
   private func present(mode: PopupMode, anchor: CGRect?) {
@@ -156,7 +296,7 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
       window.level = .statusBar
       window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
       window.makeKeyAndOrderFront(nil)
-      startBubbleDismissMonitoring()
+      updateBubbleDismissMonitoring()
     } else {
       window.level = .floating
       window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -219,7 +359,7 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
     frame.origin.x = center.x - frame.width / 2
     frame.origin.y = center.y - frame.height / 2
     frame = clampFrameToVisible(frame)
-    window.setFrame(frame, display: true, animate: true)
+    window.setFrame(frame, display: true, animate: allowShrink)
   }
 
   private func positionWindow(anchor: CGRect?) {
@@ -302,8 +442,34 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
   }
 
   func windowDidResignKey(_ notification: Notification) {
-    if currentMode == .bubble {
+    if currentMode == .bubble, !bubblePinned {
       hideBubbleWindow()
+    }
+  }
+
+  private func setBubblePinned(_ pinned: Bool) {
+    guard bubblePinned != pinned else {
+      return
+    }
+
+    bubblePinned = pinned
+    viewModel.syncBubblePinned(pinned)
+    updateBubbleDismissMonitoring()
+  }
+
+  private func updateBubbleDismissMonitoring() {
+    guard currentMode == .bubble,
+          let window,
+          window.isVisible
+    else {
+      stopBubbleDismissMonitoring()
+      return
+    }
+
+    if bubblePinned {
+      stopBubbleDismissMonitoring()
+    } else {
+      startBubbleDismissMonitoring()
     }
   }
 
@@ -333,7 +499,7 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
         return event
       }
 
-      if self.currentMode == .bubble, event.keyCode == 53 {
+      if self.currentMode == .bubble, !self.bubblePinned, event.keyCode == 53 {
         self.hideBubbleWindow()
         return nil
       }
@@ -361,6 +527,7 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
 
   private func handleGlobalClick(_ event: NSEvent) {
     guard currentMode == .bubble,
+          !bubblePinned,
           let window,
           window.isVisible
     else {
@@ -375,6 +542,7 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
 
   private func handleLocalClick(_ event: NSEvent) {
     guard currentMode == .bubble,
+          !bubblePinned,
           let window,
           window.isVisible
     else {
@@ -395,5 +563,28 @@ final class TranslatorWindowController: NSWindowController, NSWindowDelegate {
     window.orderOut(nil)
     onBubbleDismiss?()
     onWindowHidden?()
+  }
+}
+
+private struct TransientTipView: View {
+  let message: String
+
+  var body: some View {
+    Text(message)
+      .font(.system(size: 13, weight: .semibold, design: .rounded))
+      .foregroundStyle(Color.white.opacity(0.95))
+      .multilineTextAlignment(.leading)
+      .lineLimit(3)
+      .padding(.horizontal, 14)
+      .padding(.vertical, 10)
+      .frame(maxWidth: 520, alignment: .leading)
+      .background(
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+          .fill(Color.black.opacity(0.66))
+      )
+      .overlay(
+        RoundedRectangle(cornerRadius: 12, style: .continuous)
+          .stroke(Color.white.opacity(0.14), lineWidth: 0.7)
+      )
   }
 }

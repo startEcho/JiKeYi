@@ -141,6 +141,8 @@ struct AutomationSettings: Codable, Equatable, Sendable {
   var autoCopyFirstResult: Bool
   var copyHighlightedWordOnClick: Bool
   var autoPlaySourceText: Bool
+  var directTranslateAndReplaceOnShortcut: Bool
+  var showDirectReplaceStatusTip: Bool
 
   static let defaults = AutomationSettings(
     replaceLineBreaksWithSpace: false,
@@ -149,7 +151,9 @@ struct AutomationSettings: Codable, Equatable, Sendable {
     autoCopyOcrResult: false,
     autoCopyFirstResult: false,
     copyHighlightedWordOnClick: false,
-    autoPlaySourceText: false
+    autoPlaySourceText: false,
+    directTranslateAndReplaceOnShortcut: false,
+    showDirectReplaceStatusTip: true
   )
 
   init(
@@ -159,7 +163,9 @@ struct AutomationSettings: Codable, Equatable, Sendable {
     autoCopyOcrResult: Bool,
     autoCopyFirstResult: Bool,
     copyHighlightedWordOnClick: Bool,
-    autoPlaySourceText: Bool
+    autoPlaySourceText: Bool,
+    directTranslateAndReplaceOnShortcut: Bool,
+    showDirectReplaceStatusTip: Bool
   ) {
     self.replaceLineBreaksWithSpace = replaceLineBreaksWithSpace
     self.stripCodeCommentMarkers = stripCodeCommentMarkers
@@ -168,6 +174,8 @@ struct AutomationSettings: Codable, Equatable, Sendable {
     self.autoCopyFirstResult = autoCopyFirstResult
     self.copyHighlightedWordOnClick = copyHighlightedWordOnClick
     self.autoPlaySourceText = autoPlaySourceText
+    self.directTranslateAndReplaceOnShortcut = directTranslateAndReplaceOnShortcut
+    self.showDirectReplaceStatusTip = showDirectReplaceStatusTip
   }
 
   init(from decoder: Decoder) throws {
@@ -179,6 +187,8 @@ struct AutomationSettings: Codable, Equatable, Sendable {
     self.autoCopyFirstResult = try container.decodeIfPresent(Bool.self, forKey: .autoCopyFirstResult) ?? Self.defaults.autoCopyFirstResult
     self.copyHighlightedWordOnClick = try container.decodeIfPresent(Bool.self, forKey: .copyHighlightedWordOnClick) ?? Self.defaults.copyHighlightedWordOnClick
     self.autoPlaySourceText = try container.decodeIfPresent(Bool.self, forKey: .autoPlaySourceText) ?? Self.defaults.autoPlaySourceText
+    self.directTranslateAndReplaceOnShortcut = try container.decodeIfPresent(Bool.self, forKey: .directTranslateAndReplaceOnShortcut) ?? Self.defaults.directTranslateAndReplaceOnShortcut
+    self.showDirectReplaceStatusTip = try container.decodeIfPresent(Bool.self, forKey: .showDirectReplaceStatusTip) ?? Self.defaults.showDirectReplaceStatusTip
   }
 }
 

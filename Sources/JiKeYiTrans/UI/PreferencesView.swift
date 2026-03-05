@@ -1057,6 +1057,16 @@ struct PreferencesView: View {
           note: "使用系统语音播放待翻译文本。",
           binding: automationBinding(\.autoPlaySourceText)
         )
+        automationToggle(
+          title: "Alt+数字无弹窗后台翻译并直接替换",
+          note: "开启后，按 Alt+1..9 可直接翻译当前选区并回填，不再依赖先弹窗翻译。",
+          binding: automationBinding(\.directTranslateAndReplaceOnShortcut)
+        )
+        automationToggle(
+          title: "显示后台翻译状态提示",
+          note: "后台替换时显示“正在翻译并替换...”，成功后显示“已替换”。",
+          binding: automationBinding(\.showDirectReplaceStatusTip)
+        )
       }
       .prefCard()
 

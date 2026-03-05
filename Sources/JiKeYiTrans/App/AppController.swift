@@ -34,6 +34,7 @@ final class AppController: NSObject {
   }
 
   private struct ServiceStreamingUpdate: Sendable {
+    let taskID: UUID
     let serviceID: String
     let section: StreamSection
     let partialText: String
@@ -59,6 +60,7 @@ final class AppController: NSObject {
   private var settings: AppSettings = .default
   private var isTranslating = false
   private var activeTranslationTask: Task<Void, Never>?
+  private var currentTranslationTaskID = UUID()
   private var translationStartedAt: Date?
   private var workspaceObservers: [NSObjectProtocol] = []
 
@@ -70,6 +72,7 @@ final class AppController: NSObject {
   private var replaceableTranslationsByServiceID: [String: String] = [:]
   private var canReplaceCurrentSelection = false
   private var replacementTargetProcessIdentifier: pid_t?
+  private var activeDirectReplaceTask: Task<Void, Never>?
 
   func start() {
     translatorWindowController.onBubbleDismiss = { [weak self] in
@@ -102,9 +105,12 @@ final class AppController: NSObject {
   func stop() {
     activeTranslationTask?.cancel()
     activeTranslationTask = nil
+    currentTranslationTaskID = UUID()
+    activeDirectReplaceTask?.cancel()
+    activeDirectReplaceTask = nil
     stopWorkspaceObservers()
     hotKeyManager.unregisterAll()
-    clearReplacementContext()
+    clearReplacementContext(reRegisterHotKeys: false)
   }
 
   private func setupStatusItemIfNeeded() {
@@ -124,6 +130,7 @@ final class AppController: NSObject {
 
   private func applySettings() {
     registerHotKeys()
+    registerReplaceHotKeys()
     rebuildStatusMenu()
     preferencesWindowController?.refresh(settings)
   }
@@ -257,28 +264,31 @@ final class AppController: NSObject {
 
   private func triggerTranslate(source: TranslateSource) {
     let sourceProcessIdentifier = source == .selection ? NSWorkspace.shared.frontmostApplication?.processIdentifier : nil
+    activeDirectReplaceTask?.cancel()
+    activeDirectReplaceTask = nil
 
     if isTranslating {
-      let now = Date()
-      let elapsed = now.timeIntervalSince(translationStartedAt ?? now)
-      if elapsed < 180 {
-        return
-      }
-
       activeTranslationTask?.cancel()
       activeTranslationTask = nil
       isTranslating = false
       translationStartedAt = nil
+      currentTranslationTaskID = UUID()
     }
 
     isTranslating = true
     translationStartedAt = Date()
+    let taskID = UUID()
+    currentTranslationTaskID = taskID
 
     let task = Task { [weak self] in
       guard let self else {
         return
       }
-      await self.performTranslationFlow(source: source, sourceProcessIdentifier: sourceProcessIdentifier)
+      await self.performTranslationFlow(
+        source: source,
+        sourceProcessIdentifier: sourceProcessIdentifier,
+        taskID: taskID
+      )
     }
     activeTranslationTask = task
   }
@@ -292,13 +302,24 @@ final class AppController: NSObject {
     activeTranslationTask = nil
     isTranslating = false
     translationStartedAt = nil
+    currentTranslationTaskID = UUID()
   }
 
-  private func performTranslationFlow(source: TranslateSource, sourceProcessIdentifier: pid_t?) async {
+  private func performTranslationFlow(
+    source: TranslateSource,
+    sourceProcessIdentifier: pid_t?,
+    taskID: UUID
+  ) async {
     defer {
-      isTranslating = false
-      activeTranslationTask = nil
-      translationStartedAt = nil
+      if currentTranslationTaskID == taskID {
+        isTranslating = false
+        activeTranslationTask = nil
+        translationStartedAt = nil
+      }
+    }
+
+    guard currentTranslationTaskID == taskID else {
+      return
     }
 
     let currentSettings = settings
@@ -362,20 +383,24 @@ final class AppController: NSObject {
 
     let streamingConsumer = Task { @MainActor [weak self] in
       for await update in streamingUpdates {
+        guard let self, update.taskID == self.currentTranslationTaskID else {
+          continue
+        }
+
         switch update.section {
         case .translation:
-          self?.translatorWindowController.updateServiceStreaming(
+          self.translatorWindowController.updateServiceStreaming(
             serviceID: update.serviceID,
             text: update.partialText,
             thinking: update.partialThinking
           )
         case .explanation:
-          self?.translatorWindowController.updateServiceExplanationStreaming(
+          self.translatorWindowController.updateServiceExplanationStreaming(
             serviceID: update.serviceID,
             text: update.partialText
           )
         case .englishLearning:
-          self?.translatorWindowController.updateServiceLearningStreaming(
+          self.translatorWindowController.updateServiceLearningStreaming(
             serviceID: update.serviceID,
             text: update.partialText
           )
@@ -402,6 +427,7 @@ final class AppController: NSObject {
                   onUpdate: { progress in
                     continuation?.yield(
                       ServiceStreamingUpdate(
+                        taskID: taskID,
                         serviceID: serviceCopy.id,
                         section: .explanation,
                         partialText: progress,
@@ -451,6 +477,7 @@ final class AppController: NSObject {
                   onUpdate: { progress in
                     continuation?.yield(
                       ServiceStreamingUpdate(
+                        taskID: taskID,
                         serviceID: serviceCopy.id,
                         section: .englishLearning,
                         partialText: progress,
@@ -499,6 +526,7 @@ final class AppController: NSObject {
                 onUpdate: { progress in
                   continuation?.yield(
                     ServiceStreamingUpdate(
+                      taskID: taskID,
                       serviceID: service.id,
                       section: .translation,
                       partialText: progress.text,
@@ -531,6 +559,10 @@ final class AppController: NSObject {
           break
         }
 
+        guard currentTranslationTaskID == taskID else {
+          continue
+        }
+
         if let translatedText = outcome.translatedText {
           replaceableTranslationsByServiceID[outcome.serviceID] = translatedText
           translatorWindowController.updateServiceResult(
@@ -559,6 +591,9 @@ final class AppController: NSObject {
         continue
       }
       let outcome = await task.value
+      guard currentTranslationTaskID == taskID else {
+        continue
+      }
       switch outcome.kind {
       case .explanation:
         if let text = outcome.text {
@@ -593,6 +628,10 @@ final class AppController: NSObject {
 
     streamingContinuation?.finish()
     await streamingConsumer.value
+
+    guard currentTranslationTaskID == taskID else {
+      return
+    }
 
     translatorWindowController.finishCurrentTask()
   }
@@ -672,21 +711,59 @@ final class AppController: NSObject {
   }
 
   private func clearReplacementContext() {
-    replaceHotKeyManager.unregisterAll()
+    clearReplacementContext(reRegisterHotKeys: true)
+  }
+
+  private func clearReplacementContext(reRegisterHotKeys: Bool) {
     replaceShortcutServiceIDs.removeAll(keepingCapacity: false)
     replaceShortcutServiceNames.removeAll(keepingCapacity: false)
     replaceableTranslationsByServiceID.removeAll(keepingCapacity: false)
     canReplaceCurrentSelection = false
     replacementTargetProcessIdentifier = nil
+    if reRegisterHotKeys {
+      registerReplaceHotKeys()
+    } else {
+      replaceHotKeyManager.unregisterAll()
+    }
+  }
+
+  private func activeReplaceShortcutServiceIDs() -> [String] {
+    if canReplaceCurrentSelection, !replaceShortcutServiceIDs.isEmpty {
+      return replaceShortcutServiceIDs
+    }
+
+    guard settings.automation.directTranslateAndReplaceOnShortcut else {
+      return []
+    }
+
+    return settings.resolveDisplayServices(for: settings.env.popupMode()).map(\.id)
+  }
+
+  private func resolveReplaceServiceName(serviceID: String) -> String {
+    if let serviceName = replaceShortcutServiceNames[serviceID] {
+      return serviceName
+    }
+    if let service = settings.services.first(where: { $0.id == serviceID }) {
+      return service.name
+    }
+    return serviceID
+  }
+
+  private func resolveReplaceServiceConfig(serviceID: String) -> ServiceConfig? {
+    if let exact = settings.services.first(where: { $0.id == serviceID && $0.enabled }) {
+      return exact
+    }
+    return settings.resolveDisplayServices(for: settings.env.popupMode()).first(where: { $0.id == serviceID })
   }
 
   private func registerReplaceHotKeys() {
     replaceHotKeyManager.unregisterAll()
-    guard canReplaceCurrentSelection else {
+    let serviceIDs = activeReplaceShortcutServiceIDs()
+    guard !serviceIDs.isEmpty else {
       return
     }
 
-    for (index, _) in replaceShortcutServiceIDs.prefix(9).enumerated() {
+    for (index, _) in serviceIDs.prefix(9).enumerated() {
       let shortcut = "Alt+\(index + 1)"
       _ = replaceHotKeyManager.register(shortcut: shortcut) { [weak self] in
         Task { @MainActor in
@@ -702,56 +779,179 @@ final class AppController: NSObject {
   }
 
   private func replaceWithShortcut(index: Int) {
-    guard canReplaceCurrentSelection else {
-      return
-    }
-    guard index >= 0, index < replaceShortcutServiceIDs.count else {
+    let serviceIDs = activeReplaceShortcutServiceIDs()
+    guard index >= 0, index < serviceIDs.count else {
       return
     }
 
-    let serviceID = replaceShortcutServiceIDs[index]
-    guard let translated = replaceableTranslationsByServiceID[serviceID] else {
+    let serviceID = serviceIDs[index]
+    if canReplaceCurrentSelection, let translated = replaceableTranslationsByServiceID[serviceID] {
+      replaceSelectionText(with: translated, serviceID: serviceID, trigger: .shortcut(index + 1))
+      return
+    }
+
+    if canReplaceCurrentSelection || !settings.automation.directTranslateAndReplaceOnShortcut {
       translatorWindowController.setGlobalMessage("Alt+\(index + 1) 对应服务译文尚未完成。")
       NSSound.beep()
       return
     }
 
-    replaceSelectionText(with: translated, serviceID: serviceID, trigger: .shortcut(index + 1))
-  }
-
-  private func replaceSelectionText(with rawText: String, serviceID: String, trigger: ReplaceTrigger) {
-    guard canReplaceCurrentSelection else {
-      translatorWindowController.setGlobalMessage("当前任务不支持替换原文，仅选中文本翻译可用。")
-      NSSound.beep()
-      return
-    }
-
-    let translated = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !translated.isEmpty else {
-      translatorWindowController.setGlobalMessage("译文为空，无法替换。")
-      NSSound.beep()
-      return
-    }
-
-    replaceableTranslationsByServiceID[serviceID] = translated
-    let success = selectionReplacementWriter.replaceSelectionText(
-      with: translated,
-      targetProcessIdentifier: replacementTargetProcessIdentifier
-    )
-
-    if success {
-      let serviceName = replaceShortcutServiceNames[serviceID] ?? serviceID
-      switch trigger {
-      case .button:
-        translatorWindowController.setGlobalMessage("已替换为 \(serviceName) 的译文。")
-      case let .shortcut(index):
-        translatorWindowController.setGlobalMessage("已使用 Alt+\(index) 替换为 \(serviceName) 译文。")
+    guard activeDirectReplaceTask == nil else {
+      if settings.automation.showDirectReplaceStatusTip {
+        translatorWindowController.showTransientTip("已有替换任务进行中")
       }
       return
     }
 
-    translatorWindowController.setGlobalMessage("替换失败，请确认原应用仍有选区且已授权辅助功能。")
-    NSSound.beep()
+    guard let service = resolveReplaceServiceConfig(serviceID: serviceID) else {
+      translatorWindowController.showTransientTip("Alt+\(index + 1) 对应服务不可用，请检查服务配置。")
+      return
+    }
+
+    let sourceProcessIdentifier = NSWorkspace.shared.frontmostApplication?.processIdentifier
+    let settingsSnapshot = settings
+    let shortcutNumber = index + 1
+    let showStatusTip = settingsSnapshot.automation.showDirectReplaceStatusTip
+
+    if showStatusTip {
+      translatorWindowController.showPersistentTransientTip("正在翻译并替换...")
+    }
+
+    activeDirectReplaceTask = Task { [weak self] in
+      guard let self else {
+        return
+      }
+      await self.performDirectTranslateAndReplace(
+        service: service,
+        sourceProcessIdentifier: sourceProcessIdentifier,
+        settingsSnapshot: settingsSnapshot,
+        shortcutNumber: shortcutNumber,
+        showStatusTip: showStatusTip
+      )
+    }
+  }
+
+  private func performDirectTranslateAndReplace(
+    service: ServiceConfig,
+    sourceProcessIdentifier: pid_t?,
+    settingsSnapshot: AppSettings,
+    shortcutNumber: Int,
+    showStatusTip: Bool
+  ) async {
+    defer {
+      activeDirectReplaceTask = nil
+      if Task.isCancelled {
+        translatorWindowController.hideTransientTip()
+      }
+    }
+
+    do {
+      let payload = try await fetchSourcePayload(source: .selection)
+      if Task.isCancelled {
+        return
+      }
+
+      let preparedSource = preprocessSourceText(payload.text, automation: settingsSnapshot.automation)
+      guard !preparedSource.isEmpty else {
+        translatorWindowController.showTransientTip("Alt+\(shortcutNumber) 翻译失败：选区内容为空。")
+        return
+      }
+
+      let translated = try await AppController.runWithTimeout(
+        milliseconds: service.timeoutMilliseconds
+      ) {
+        try await self.translatorClient.translateStreaming(
+          text: preparedSource,
+          service: service,
+          glossary: settingsSnapshot.glossary,
+          onUpdate: nil
+        )
+      }
+
+      if Task.isCancelled {
+        return
+      }
+
+      let replaced = replaceSelectionText(
+        with: translated,
+        serviceID: service.id,
+        trigger: .shortcut(shortcutNumber),
+        allowWithoutSelectionContext: true,
+        targetProcessIdentifierOverride: sourceProcessIdentifier,
+        emitFeedback: false
+      )
+      if replaced {
+        if showStatusTip {
+          translatorWindowController.showTransientTip("已替换", duration: 1.0)
+        }
+      } else {
+        translatorWindowController.showTransientTip("替换失败，请确认原应用仍有选区且已授权辅助功能。")
+      }
+    } catch {
+      if Task.isCancelled {
+        return
+      }
+
+      let translatorError = error as? TranslatorError
+      let preview = translatorError?.responsePreview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let message = translatorError?.localizedDescription ?? error.localizedDescription
+      let merged = preview.isEmpty ? message : "\(message)（\(preview)）"
+      translatorWindowController.showTransientTip("Alt+\(shortcutNumber) 翻译失败：\(merged)")
+    }
+  }
+
+  @discardableResult
+  private func replaceSelectionText(
+    with rawText: String,
+    serviceID: String,
+    trigger: ReplaceTrigger,
+    allowWithoutSelectionContext: Bool = false,
+    targetProcessIdentifierOverride: pid_t? = nil,
+    emitFeedback: Bool = true
+  ) -> Bool {
+    guard canReplaceCurrentSelection || allowWithoutSelectionContext else {
+      if emitFeedback {
+        translatorWindowController.setGlobalMessage("当前任务不支持替换原文，仅选中文本翻译可用。")
+        NSSound.beep()
+      }
+      return false
+    }
+
+    let translated = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !translated.isEmpty else {
+      if emitFeedback {
+        translatorWindowController.setGlobalMessage("译文为空，无法替换。")
+        NSSound.beep()
+      }
+      return false
+    }
+
+    if canReplaceCurrentSelection {
+      replaceableTranslationsByServiceID[serviceID] = translated
+    }
+    let success = selectionReplacementWriter.replaceSelectionText(
+      with: translated,
+      targetProcessIdentifier: targetProcessIdentifierOverride ?? replacementTargetProcessIdentifier
+    )
+
+    if success {
+      if emitFeedback {
+        let serviceName = resolveReplaceServiceName(serviceID: serviceID)
+        switch trigger {
+        case .button:
+          translatorWindowController.setGlobalMessage("已替换为 \(serviceName) 的译文。")
+        case let .shortcut(index):
+          translatorWindowController.setGlobalMessage("已使用 Alt+\(index) 替换为 \(serviceName) 译文。")
+        }
+      }
+      return true
+    }
+
+    if emitFeedback {
+      translatorWindowController.setGlobalMessage("替换失败，请确认原应用仍有选区且已授权辅助功能。")
+      NSSound.beep()
+    }
+    return false
   }
 
   private func speakSourceText(_ text: String) {
